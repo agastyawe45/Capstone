@@ -1,0 +1,5 @@
+Flask==2.0.1
+Werkzeug==2.0.1
+pytest==7.0.1
+bandit==1.7.5
+safety==2.3.5 
