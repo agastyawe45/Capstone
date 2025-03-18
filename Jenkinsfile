@@ -4,6 +4,7 @@ pipeline {
     environment {
         DOCKER_IMAGE = 'capstone-devsecops'
         DOCKER_TAG = "${BUILD_NUMBER}"
+        APP_PORT = '5000'
     }
 
     stages {
@@ -15,14 +16,17 @@ pipeline {
 
         stage('Install Dependencies') {
             steps {
-                sh 'python -m pip install --upgrade pip'
-                sh 'pip install -r requirements.txt'
+                bat '''
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install bandit safety pytest
+                '''
             }
         }
 
         stage('Run Tests') {
             steps {
-                sh 'python -m pytest tests/'
+                bat 'python -m pytest tests/'
             }
         }
 
@@ -30,16 +34,13 @@ pipeline {
             steps {
                 script {
                     try {
-                        sh '''
-                            bandit -r . -f json -o bandit-report.json
-                            bandit -r . -f html -o bandit-report.html
-                        '''
+                        bat 'bandit -r . -f json -o bandit-report.json'
+                        archiveArtifacts artifacts: 'bandit-report.json', fingerprint: true
                     } catch (err) {
                         echo "Bandit found security issues"
                         currentBuild.result = 'UNSTABLE'
                     }
                 }
-                archiveArtifacts artifacts: 'bandit-report.*', fingerprint: true
             }
         }
 
@@ -47,21 +48,43 @@ pipeline {
             steps {
                 script {
                     try {
-                        sh 'safety check --json > safety-report.json'
-                        sh 'safety check --output text > safety-report.txt'
+                        bat 'safety check --json > safety-report.json'
+                        archiveArtifacts artifacts: 'safety-report.json', fingerprint: true
                     } catch (err) {
                         echo "Safety found dependency issues"
                         currentBuild.result = 'UNSTABLE'
                     }
                 }
-                archiveArtifacts artifacts: 'safety-report.*', fingerprint: true
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 script {
-                    docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}", "-f docker/Dockerfile .")
+                    try {
+                        bat "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} -f docker/Dockerfile ."
+                    } catch (err) {
+                        error "Failed to build Docker image: ${err}"
+                    }
+                }
+            }
+        }
+
+        stage('Run Container') {
+            steps {
+                script {
+                    try {
+                        // Run new container
+                        bat "docker run -d --name ${DOCKER_IMAGE}_${BUILD_NUMBER} -p 5000:5000 ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        
+                        // Wait for application to start
+                        bat "timeout 10"
+                        
+                        // Test if application is running
+                        bat "curl http://localhost:5000"
+                    } catch (err) {
+                        error "Failed to run container: ${err}"
+                    }
                 }
             }
         }
@@ -70,12 +93,8 @@ pipeline {
             steps {
                 script {
                     def banditReport = readJSON file: 'bandit-report.json'
-                    def safetyReport = readJSON file: 'safety-report.json'
-                    
-                    def highSeverityIssues = banditReport.metrics.SEVERITY.HIGH ?: 0
-                    
-                    if (highSeverityIssues > 0) {
-                        error "Found ${highSeverityIssues} high severity issues in SAST scan"
+                    if (banditReport.metrics.SEVERITY.HIGH > 0) {
+                        error "High severity issues found in SAST scan"
                     }
                 }
             }
@@ -84,6 +103,13 @@ pipeline {
 
     post {
         always {
+            script {
+                // Cleanup containers
+                bat """
+                    docker ps -q --filter name=${DOCKER_IMAGE} | findstr . && docker stop ${DOCKER_IMAGE}_${BUILD_NUMBER} || echo No container running
+                    docker ps -aq --filter name=${DOCKER_IMAGE} | findstr . && docker rm ${DOCKER_IMAGE}_${BUILD_NUMBER} || echo No container to remove
+                """
+            }
             cleanWs()
         }
         success {
