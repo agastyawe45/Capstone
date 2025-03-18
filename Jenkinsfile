@@ -8,12 +8,30 @@ pipeline {
         APP_PORT = '5000'
         DOCKER_DESKTOP = true  // Set to true if using Docker Desktop
         DOCKER_OPTIONAL = true  // Set to true to make Docker stages optional
+        SLACK_CHANNEL = '#jenkins-notifications'
+        SLACK_TOKEN = credentials('slack-token') // Configure this in Jenkins credentials
     }
 
     stages {
         stage('Checkout') {
             steps {
                 checkout scm
+            }
+            post {
+                success {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: "✅ Code checkout successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                    )
+                }
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ Code checkout failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                    )
+                }
             }
         }
 
@@ -41,13 +59,24 @@ pipeline {
                         def banditReport = readJSON file: 'bandit-report.json'
                         
                         if (banditReport.results.size() > 0) {
-                            echo "Bandit found security issues"
-                            currentBuild.result = 'UNSTABLE'
+                            slackSend(
+                                channel: env.SLACK_CHANNEL,
+                                color: 'warning',
+                                message: """
+                                ⚠️ *Security Issues Found*
+                                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                                - Issues: ${banditReport.results.size()}
+                                - Details: ${env.BUILD_URL}artifact/bandit-report.json
+                                """
+                            )
                         }
                     } catch (Exception e) {
-                        echo "Error in Bandit scan: ${e.message}"
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: "❌ SAST scan failed: ${e.message}"
+                        )
                         currentBuild.result = 'UNSTABLE'
-                        // Don't fail the build, continue to next stage
                     }
                 }
             }
@@ -142,6 +171,52 @@ pipeline {
             }
         }
 
+        stage('DAST - OWASP ZAP Scan') {
+            steps {
+                script {
+                    try {
+                        // Start your Flask application (adjust port if needed)
+                        bat 'start /B python app.py'
+                        
+                        // Wait for application to start
+                        sleep 10
+
+                        // Run ZAP scan
+                        bat '''
+                            docker run -v ${WORKSPACE}/zap-report:/zap/wrk/:rw -t owasp/zap2docker-stable zap-baseline.py ^
+                            -t http://host.docker.internal:5000 ^
+                            -r zap-report.html ^
+                            -I
+                        '''
+
+                        // Archive ZAP report
+                        archiveArtifacts artifacts: 'zap-report/*', fingerprint: true
+
+                    } catch (Exception e) {
+                        echo "DAST scan had issues: ${e.message}"
+                        currentBuild.result = 'UNSTABLE'
+                    } finally {
+                        // Stop the Flask application
+                        bat 'taskkill /F /IM python.exe'
+                    }
+                }
+            }
+            post {
+                always {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: currentBuild.result == 'SUCCESS' ? 'good' : 'danger',
+                        message: """
+                        *DAST Scan Complete*
+                        Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                        Status: ${currentBuild.result ?: 'SUCCESS'}
+                        Report: ${env.BUILD_URL}artifact/zap-report/
+                        """
+                    )
+                }
+            }
+        }
+
         stage('Security Report Analysis') {
             steps {
                 script {
@@ -178,9 +253,18 @@ pipeline {
                             }.join('\n')}
                         """
                         
+                        // Add ZAP results to security summary
+                        if (fileExists('zap-report/zap-report.html')) {
+                            def zapSummary = """
+                            DAST Scan Results:
+                            - Report available at: ${env.BUILD_URL}artifact/zap-report/
+                            """
+                            summary += zapSummary
+                        }
+
                         echo summary
                         writeFile file: 'security-summary.txt', text: summary
-                        archiveArtifacts artifacts: '*-report.json,security-summary.txt', fingerprint: true
+                        archiveArtifacts artifacts: '*-report.*,security-summary.txt', fingerprint: true
                         
                         if (highCount > 0) {
                             currentBuild.result = 'UNSTABLE'
@@ -191,10 +275,62 @@ pipeline {
                     }
                 }
             }
+            post {
+                always {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: currentBuild.result == 'SUCCESS' ? 'good' : 'warning',
+                        message: """
+                        *Security Scan Results*
+                        Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                        Status: ${currentBuild.result ?: 'SUCCESS'}
+                        Details: ${env.BUILD_URL}
+                        """
+                    )
+                }
+            }
         }
     }
 
     post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: """
+                ✅ *Pipeline Successful*
+                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                Duration: ${currentBuild.durationString}
+                URL: ${env.BUILD_URL}
+                """
+            )
+        }
+        unstable {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'warning',
+                message: """
+                ⚠️ *Pipeline Unstable*
+                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                Duration: ${currentBuild.durationString}
+                URL: ${env.BUILD_URL}
+                - Security vulnerabilities were found
+                - Check the security reports in the build artifacts
+                """
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """
+                ❌ *Pipeline Failed*
+                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                Duration: ${currentBuild.durationString}
+                URL: ${env.BUILD_URL}
+                """
+            )
+        }
         always {
             script {
                 try {
@@ -210,20 +346,6 @@ pipeline {
                 }
                 cleanWs()
             }
-        }
-        success {
-            echo 'Pipeline completed successfully!'
-        }
-        unstable {
-            echo '''
-            Pipeline completed with issues:
-            1. Security vulnerabilities were found in the code
-            2. Check the security reports in the build artifacts
-            3. Docker stages were skipped (Docker not available)
-            '''
-        }
-        failure {
-            echo 'Pipeline failed! Check the logs for details.'
         }
     }
 } 
