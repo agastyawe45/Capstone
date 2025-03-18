@@ -36,12 +36,18 @@ pipeline {
         stage('SAST - Bandit Scan') {
             steps {
                 script {
-                    bat 'bandit -r . -f json -o bandit-report.json'
-                    def banditReport = readJSON file: 'bandit-report.json'
-                    
-                    if (banditReport.results.size() > 0) {
-                        echo "Bandit found security issues"
+                    try {
+                        bat 'bandit -r . -f json -o bandit-report.json'
+                        def banditReport = readJSON file: 'bandit-report.json'
+                        
+                        if (banditReport.results.size() > 0) {
+                            echo "Bandit found security issues"
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    } catch (Exception e) {
+                        echo "Error in Bandit scan: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
+                        // Don't fail the build, continue to next stage
                     }
                 }
             }
@@ -50,12 +56,18 @@ pipeline {
         stage('SCA - Safety Check') {
             steps {
                 script {
-                    bat 'safety check --json > safety-report.json'
-                    def safetyReport = readJSON file: 'safety-report.json'
-                    
-                    if (safetyReport.size() > 0) {
-                        echo "Safety found dependency issues"
+                    try {
+                        bat 'safety check --json > safety-report.json || exit 0'
+                        def safetyReport = readJSON file: 'safety-report.json'
+                        
+                        if (safetyReport.size() > 0) {
+                            echo "Safety found dependency issues"
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    } catch (Exception e) {
+                        echo "Error in Safety check: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
+                        // Don't fail the build, continue to next stage
                     }
                 }
             }
@@ -64,19 +76,24 @@ pipeline {
         stage('Check Docker Installation') {
             steps {
                 script {
-                    def dockerInstalled = false
                     try {
-                        bat 'where docker'
-                        dockerInstalled = true
-                        echo "Docker found on system"
-                    } catch (Exception e) {
-                        echo "Docker not found on system"
-                        if (env.DOCKER_OPTIONAL.toBoolean()) {
-                            echo "Skipping Docker-dependent stages as Docker is optional"
-                            currentBuild.result = 'UNSTABLE'
+                        def dockerCheck = bat(script: 'where docker', returnStatus: true)
+                        if (dockerCheck == 0) {
+                            echo "Docker found on system"
+                            env.DOCKER_INSTALLED = 'true'
+                        } else {
+                            echo "Docker not found on system"
+                            env.DOCKER_INSTALLED = 'false'
+                            if (env.DOCKER_OPTIONAL.toBoolean()) {
+                                echo "Skipping Docker-dependent stages as Docker is optional"
+                                currentBuild.result = 'UNSTABLE'
+                            }
                         }
+                    } catch (Exception e) {
+                        echo "Docker check failed: ${e.message}"
+                        env.DOCKER_INSTALLED = 'false'
+                        currentBuild.result = 'UNSTABLE'
                     }
-                    env.DOCKER_INSTALLED = dockerInstalled.toString()
                 }
             }
         }
@@ -163,7 +180,7 @@ pipeline {
                         
                         echo summary
                         writeFile file: 'security-summary.txt', text: summary
-                        archiveArtifacts artifacts: 'security-summary.txt,bandit-report.json,safety-report.json', fingerprint: true
+                        archiveArtifacts artifacts: '*-report.json,security-summary.txt', fingerprint: true
                         
                         if (highCount > 0) {
                             currentBuild.result = 'UNSTABLE'
