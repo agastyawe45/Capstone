@@ -36,11 +36,10 @@ pipeline {
         stage('SAST - Bandit Scan') {
             steps {
                 script {
-                    try {
-                        bat 'bandit -r . -f json -o bandit-report.json'
-                        bat 'bandit -r . -f html -o bandit-report.html || echo "HTML report generation failed but continuing"'
-                        archiveArtifacts artifacts: 'bandit-report.*', fingerprint: true
-                    } catch (err) {
+                    bat 'bandit -r . -f json -o bandit-report.json'
+                    def banditReport = readJSON file: 'bandit-report.json'
+                    
+                    if (banditReport.results.size() > 0) {
                         echo "Bandit found security issues"
                         currentBuild.result = 'UNSTABLE'
                     }
@@ -51,11 +50,10 @@ pipeline {
         stage('SCA - Safety Check') {
             steps {
                 script {
-                    try {
-                        bat 'safety check --json > safety-report.json'
-                        bat 'safety check --output text > safety-report.txt || echo "Text report generation failed but continuing"'
-                        archiveArtifacts artifacts: 'safety-report.*', fingerprint: true
-                    } catch (err) {
+                    bat 'safety check --json > safety-report.json'
+                    def safetyReport = readJSON file: 'safety-report.json'
+                    
+                    if (safetyReport.size() > 0) {
                         echo "Safety found dependency issues"
                         currentBuild.result = 'UNSTABLE'
                     }
@@ -68,21 +66,13 @@ pipeline {
                 script {
                     def dockerInstalled = false
                     try {
-                        def dockerCheck = bat(script: 'where docker', returnStatus: true)
-                        if (dockerCheck == 0) {
-                            echo "Docker found on system"
-                            dockerInstalled = true
-                        } else {
-                            echo "Docker not found on system"
-                            if (env.DOCKER_OPTIONAL.toBoolean()) {
-                                echo "Skipping Docker-dependent stages as Docker is optional"
-                                currentBuild.result = 'UNSTABLE'
-                            }
-                        }
+                        bat 'where docker'
+                        dockerInstalled = true
+                        echo "Docker found on system"
                     } catch (Exception e) {
-                        echo "Docker check failed: ${e.message}"
+                        echo "Docker not found on system"
                         if (env.DOCKER_OPTIONAL.toBoolean()) {
-                            echo "Skipping Docker-dependent stages"
+                            echo "Skipping Docker-dependent stages as Docker is optional"
                             currentBuild.result = 'UNSTABLE'
                         }
                     }
@@ -140,15 +130,25 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def safetyReport = readJSON file: 'safety-report.json'
+                        def highCount = 0
+                        def mediumCount = 0
+                        def lowCount = 0
                         
-                        // Analyze Bandit results
-                        if (banditReport.results) {
-                            def highCount = banditReport.results.count { it.issue_severity == 'HIGH' }
-                            def mediumCount = banditReport.results.count { it.issue_severity == 'MEDIUM' }
-                            def lowCount = banditReport.results.count { it.issue_severity == 'LOW' }
-                            
-                            echo """
+                        banditReport.results.each { issue ->
+                            switch(issue.issue_severity) {
+                                case 'HIGH':
+                                    highCount++
+                                    break
+                                case 'MEDIUM':
+                                    mediumCount++
+                                    break
+                                case 'LOW':
+                                    lowCount++
+                                    break
+                            }
+                        }
+                        
+                        def summary = """
                             Security Scan Results:
                             Total Issues: ${banditReport.results.size()}
                             High Severity: ${highCount}
@@ -159,43 +159,14 @@ pipeline {
                             ${banditReport.results.findAll { it.issue_severity == 'HIGH' }.collect { 
                                 "- ${it.issue_text} in ${it.filename}:${it.line_number}"
                             }.join('\n')}
-                            """
-                            
-                            // Generate detailed report
-                            def reportContent = """
-                            Security Scan Summary
-                            ===================
-                            
-                            SAST Scan (Bandit):
-                            ------------------
-                            ${banditReport.results.collect { issue ->
-                                """
-                                Severity: ${issue.issue_severity}
-                                Issue: ${issue.issue_text}
-                                Location: ${issue.filename}:${issue.line_number}
-                                More Info: ${issue.more_info}
-                                """
-                            }.join('\n')}
-                            
-                            Dependency Check (Safety):
-                            ------------------------
-                            ${safetyReport.collect { dep ->
-                                """
-                                Package: ${dep.package}
-                                Version: ${dep.installed_version}
-                                Vulnerability: ${dep.vulnerability_id}
-                                Advisory: ${dep.advisory}
-                                """
-                            }.join('\n')}
-                            """
-                            
-                            writeFile file: 'security-report.txt', text: reportContent
-                            archiveArtifacts artifacts: 'security-report.txt', fingerprint: true
-                            
-                            if (highCount > 0) {
-                                currentBuild.result = 'UNSTABLE'
-                                error "High severity security issues found!"
-                            }
+                        """
+                        
+                        echo summary
+                        writeFile file: 'security-summary.txt', text: summary
+                        archiveArtifacts artifacts: 'security-summary.txt,bandit-report.json,safety-report.json', fingerprint: true
+                        
+                        if (highCount > 0) {
+                            currentBuild.result = 'UNSTABLE'
                         }
                     } catch (Exception e) {
                         echo "Error analyzing security reports: ${e.message}"
