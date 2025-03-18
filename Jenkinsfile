@@ -111,13 +111,13 @@ pipeline {
             steps {
                 script {
                     try {
-                        // Stop and remove any existing container with same name
-                        bat """
-                            for /f "tokens=*" %%i in ('%DOCKER_PATH% ps -q --filter name=${DOCKER_IMAGE}_${BUILD_NUMBER}') do (
-                                %DOCKER_PATH% stop %%i 2>nul
-                                %DOCKER_PATH% rm %%i 2>nul
+                        // Fix the filter format
+                        bat '''
+                            for /F "tokens=*" %%i in ('docker ps -q --filter "name=capstone-devsecops"') do (
+                                docker stop %%i 2>nul
+                                docker rm %%i 2>nul
                             )
-                        """
+                        '''
                         
                         // Run new container
                         bat "%DOCKER_PATH% run -d --name ${DOCKER_IMAGE}_${BUILD_NUMBER} -p ${APP_PORT}:5000 ${DOCKER_IMAGE}:${DOCKER_TAG}"
@@ -127,8 +127,8 @@ pipeline {
                         
                         // Test if application is running
                         bat "curl http://localhost:${APP_PORT} || echo Application may not be running properly"
-                    } catch (err) {
-                        echo "Warning: Container execution had issues: ${err}"
+                    } catch (Exception e) {
+                        echo "Warning: Container execution had issues: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
                     }
                 }
@@ -140,46 +140,63 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def highCount = 0
-                        def mediumCount = 0
+                        def safetyReport = readJSON file: 'safety-report.json'
                         
+                        // Analyze Bandit results
                         if (banditReport.results) {
-                            echo "Found ${banditReport.results.size()} security issues in total"
+                            def highCount = banditReport.results.count { it.issue_severity == 'HIGH' }
+                            def mediumCount = banditReport.results.count { it.issue_severity == 'MEDIUM' }
+                            def lowCount = banditReport.results.count { it.issue_severity == 'LOW' }
                             
-                            banditReport.results.each { issue ->
-                                if (issue.issue_severity == 'HIGH') {
-                                    highCount++
-                                } else if (issue.issue_severity == 'MEDIUM') {
-                                    mediumCount++
-                                }
-                            }
-                            
-                            echo "Security issues: ${highCount} HIGH, ${mediumCount} MEDIUM"
-                            
-                            if (highCount > 0) {
-                                echo "High severity issues found in code!"
-                                currentBuild.result = 'UNSTABLE'
-                            }
-
-                            // Generate summary report
-                            def summaryReport = """Security Scan Summary:
+                            echo """
+                            Security Scan Results:
                             Total Issues: ${banditReport.results.size()}
                             High Severity: ${highCount}
                             Medium Severity: ${mediumCount}
+                            Low Severity: ${lowCount}
                             
-                            Details:
-                            ${banditReport.results.collect { issue ->
-                                "- ${issue.issue_severity}: ${issue.issue_text} (${issue.filename}:${issue.line_number})"
+                            Details of High Severity Issues:
+                            ${banditReport.results.findAll { it.issue_severity == 'HIGH' }.collect { 
+                                "- ${it.issue_text} in ${it.filename}:${it.line_number}"
                             }.join('\n')}
                             """
                             
-                            writeFile file: 'security-summary.txt', text: summaryReport
-                            archiveArtifacts artifacts: 'security-summary.txt', fingerprint: true
-                        } else {
-                            echo "No security issues found in Bandit scan"
+                            // Generate detailed report
+                            def reportContent = """
+                            Security Scan Summary
+                            ===================
+                            
+                            SAST Scan (Bandit):
+                            ------------------
+                            ${banditReport.results.collect { issue ->
+                                """
+                                Severity: ${issue.issue_severity}
+                                Issue: ${issue.issue_text}
+                                Location: ${issue.filename}:${issue.line_number}
+                                More Info: ${issue.more_info}
+                                """
+                            }.join('\n')}
+                            
+                            Dependency Check (Safety):
+                            ------------------------
+                            ${safetyReport.collect { dep ->
+                                """
+                                Package: ${dep.package}
+                                Version: ${dep.installed_version}
+                                Vulnerability: ${dep.vulnerability_id}
+                                Advisory: ${dep.advisory}
+                                """
+                            }.join('\n')}
+                            """
+                            
+                            writeFile file: 'security-report.txt', text: reportContent
+                            archiveArtifacts artifacts: 'security-report.txt', fingerprint: true
+                            
+                            if (highCount > 0) {
+                                currentBuild.result = 'UNSTABLE'
+                                error "High severity security issues found!"
+                            }
                         }
-                        
-                        echo "Security scanning completed successfully"
                     } catch (Exception e) {
                         echo "Error analyzing security reports: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
@@ -193,18 +210,18 @@ pipeline {
         always {
             script {
                 try {
-                    // Cleanup containers with error handling
-                    bat """
-                        for /f "tokens=*" %%i in ('%DOCKER_PATH% ps -a -q --filter name=${DOCKER_IMAGE}_${BUILD_NUMBER}') do (
-                            %DOCKER_PATH% stop %%i 2>nul
-                            %DOCKER_PATH% rm %%i 2>nul
+                    // Fix the filter format for cleanup
+                    bat '''
+                        for /F "tokens=*" %%i in ('docker ps -a -q --filter "name=capstone-devsecops"') do (
+                            docker stop %%i 2>nul
+                            docker rm %%i 2>nul
                         )
-                    """
+                    '''
                 } catch (Exception e) {
                     echo "Warning: Container cleanup had issues: ${e.message}"
                 }
+                cleanWs()
             }
-            cleanWs()
         }
         success {
             echo 'Pipeline completed successfully!'
