@@ -7,6 +7,7 @@ pipeline {
         DOCKER_PATH = '"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe"'
         APP_PORT = '5000'
         DOCKER_DESKTOP = true  // Set to true if using Docker Desktop
+        DOCKER_OPTIONAL = true  // Set to true to make Docker stages optional
     }
 
     stages {
@@ -37,7 +38,8 @@ pipeline {
                 script {
                     try {
                         bat 'bandit -r . -f json -o bandit-report.json'
-                        archiveArtifacts artifacts: 'bandit-report.json', fingerprint: true
+                        bat 'bandit -r . -f html -o bandit-report.html || echo "HTML report generation failed but continuing"'
+                        archiveArtifacts artifacts: 'bandit-report.*', fingerprint: true
                     } catch (err) {
                         echo "Bandit found security issues"
                         currentBuild.result = 'UNSTABLE'
@@ -51,7 +53,8 @@ pipeline {
                 script {
                     try {
                         bat 'safety check --json > safety-report.json'
-                        archiveArtifacts artifacts: 'safety-report.json', fingerprint: true
+                        bat 'safety check --output text > safety-report.txt || echo "Text report generation failed but continuing"'
+                        archiveArtifacts artifacts: 'safety-report.*', fingerprint: true
                     } catch (err) {
                         echo "Safety found dependency issues"
                         currentBuild.result = 'UNSTABLE'
@@ -63,34 +66,47 @@ pipeline {
         stage('Check Docker Installation') {
             steps {
                 script {
-                    // Check if Docker is installed and running
+                    def dockerInstalled = false
                     try {
-                        bat 'where docker || echo "Docker not found"'
-                        def dockerPath = bat(script: 'where docker', returnStdout: true).trim()
-                        if (dockerPath) {
-                            echo "Found Docker at ${dockerPath}"
-                            env.DOCKER_PATH = dockerPath
+                        def dockerCheck = bat(script: 'where docker', returnStatus: true)
+                        if (dockerCheck == 0) {
+                            echo "Docker found on system"
+                            dockerInstalled = true
                         } else {
-                            echo "Using configured Docker path: ${DOCKER_PATH}"
+                            echo "Docker not found on system"
+                            
+                            if (env.DOCKER_OPTIONAL.toBoolean()) {
+                                echo "Skipping Docker-dependent stages as Docker is optional"
+                                currentBuild.result = 'UNSTABLE'
+                            } else {
+                                error "Docker is required but not found"
+                            }
                         }
-                        
-                        // Test Docker connection
-                        bat "%DOCKER_PATH% --version || echo Docker not running"
                     } catch (Exception e) {
-                        error "Docker installation check failed: ${e.message}"
+                        echo "Docker check failed: ${e.message}"
+                        if (env.DOCKER_OPTIONAL.toBoolean()) {
+                            echo "Skipping Docker-dependent stages as Docker is optional"
+                            currentBuild.result = 'UNSTABLE'
+                        } else {
+                            error "Docker is required but check failed"
+                        }
                     }
+                    env.DOCKER_INSTALLED = dockerInstalled.toString()
                 }
             }
         }
 
         stage('Build Docker Image') {
+            when {
+                expression { return env.DOCKER_INSTALLED == 'true' }
+            }
             steps {
                 script {
                     try {
-                        // Build with explicit Docker path
-                        bat "%DOCKER_PATH% build -t ${DOCKER_IMAGE}:${DOCKER_TAG} -f docker/Dockerfile ."
+                        bat 'docker build -t capstone-devsecops:%BUILD_NUMBER% -f docker/Dockerfile .'
                     } catch (err) {
-                        error "Failed to build Docker image: ${err}"
+                        echo "Docker build failed: ${err}"
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
             }
@@ -129,16 +145,33 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
+                        def highCount = 0
+                        def mediumCount = 0
                         
-                        // Check if HIGH severity field exists and has value
-                        if (banditReport.metrics.SEVERITY && banditReport.metrics.SEVERITY.HIGH > 0) {
-                            echo "Found ${banditReport.metrics.SEVERITY.HIGH} high severity issues"
-                            currentBuild.result = 'UNSTABLE'
+                        if (banditReport.results) {
+                            echo "Found ${banditReport.results.size()} security issues in total"
+                            
+                            banditReport.results.each { issue ->
+                                if (issue.issue_severity == 'HIGH') {
+                                    highCount++
+                                } else if (issue.issue_severity == 'MEDIUM') {
+                                    mediumCount++
+                                }
+                            }
+                            
+                            echo "Security issues: ${highCount} HIGH, ${mediumCount} MEDIUM"
+                            
+                            if (highCount > 0) {
+                                echo "High severity issues found in code!"
+                                currentBuild.result = 'UNSTABLE'
+                            }
                         } else {
-                            echo "No high severity issues found"
+                            echo "No security issues found in Bandit scan"
                         }
+                        
+                        echo "Security scanning completed successfully"
                     } catch (Exception e) {
-                        echo "Warning: Error analyzing security reports: ${e.message}"
+                        echo "Error analyzing security reports: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
                     }
                 }
@@ -166,11 +199,11 @@ pipeline {
         success {
             echo 'Pipeline completed successfully!'
         }
+        unstable {
+            echo 'Pipeline completed with issues. Check security reports for details.'
+        }
         failure {
             echo 'Pipeline failed!'
-        }
-        unstable {
-            echo 'Pipeline is unstable. Security issues may have been found.'
         }
     }
 } 
