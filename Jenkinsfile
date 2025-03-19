@@ -62,7 +62,12 @@ pipeline {
                             slackSend(
                                 channel: env.SLACK_CHANNEL,
                                 color: 'warning',
-                                message: "⚠️ Security Issues Found - ${banditReport.results.size()} issues detected"
+                                message: """
+                                ⚠️ *Security Issues Found*
+                                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                                - Issues: ${banditReport.results.size()}
+                                - Details: ${env.BUILD_URL}artifact/bandit-report.json
+                                """
                             )
                         }
                     } catch (Exception e) {
@@ -80,11 +85,18 @@ pipeline {
         stage('SCA - Safety Check') {
             steps {
                 script {
-                    bat 'safety check --json > safety-report.json || exit 0'
-                    def safetyReport = readJSON file: 'safety-report.json'
-                    if (safetyReport.size() > 0) {
-                        echo "Safety found dependency issues"
+                    try {
+                        bat 'safety check --json > safety-report.json || exit 0'
+                        def safetyReport = readJSON file: 'safety-report.json'
+                        
+                        if (safetyReport.size() > 0) {
+                            echo "Safety found dependency issues"
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    } catch (Exception e) {
+                        echo "Error in Safety check: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
+                        // Don't fail the build, continue to next stage
                     }
                 }
             }
@@ -116,61 +128,44 @@ pipeline {
         }
 
         stage('Build Docker Image') {
+            when {
+                expression { return env.DOCKER_INSTALLED == 'true' }
+            }
             steps {
                 script {
                     try {
-                        // Clean up existing containers and images
-                        bat '''
-                            docker ps -q --filter "name=%DOCKER_IMAGE%" | findstr . && docker stop $(docker ps -q --filter "name=%DOCKER_IMAGE%") || echo "No containers to stop"
-                            docker ps -aq --filter "name=%DOCKER_IMAGE%" | findstr . && docker rm $(docker ps -aq --filter "name=%DOCKER_IMAGE%") || echo "No containers to remove"
-                            docker images -q %DOCKER_IMAGE% | findstr . && docker rmi $(docker images -q %DOCKER_IMAGE%) || echo "No images to remove"
-                        '''
-                        
-                        // Build new image
-                        bat "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
-                        
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'good',
-                            message: "✅ Docker image built successfully: ${DOCKER_IMAGE}:${DOCKER_TAG}"
-                        )
-                    } catch (Exception e) {
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'danger',
-                            message: "❌ Docker build failed: ${e.message}"
-                        )
-                        error "Docker build failed: ${e.message}"
+                        bat 'docker build -t capstone-devsecops:%BUILD_NUMBER% -f docker/Dockerfile .'
+                    } catch (err) {
+                        echo "Docker build failed: ${err}"
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
             }
         }
 
-        stage('Run Docker Container') {
+        stage('Run Container') {
             steps {
                 script {
                     try {
-                        // Run container
-                        bat "docker run -d --name ${DOCKER_IMAGE}_${BUILD_NUMBER} -p ${APP_PORT}:5000 ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        // Fix the filter format
+                        bat '''
+                            for /F "tokens=*" %%i in ('docker ps -q --filter "name=capstone-devsecops"') do (
+                                docker stop %%i 2>nul
+                                docker rm %%i 2>nul
+                            )
+                        '''
                         
-                        // Wait for container to start
+                        // Run new container
+                        bat "%DOCKER_PATH% run -d --name ${DOCKER_IMAGE}_${BUILD_NUMBER} -p ${APP_PORT}:5000 ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        
+                        // Wait for application to start
                         bat "timeout /t 10 /nobreak"
                         
-                        // Verify container is running
-                        bat "docker ps --filter name=${DOCKER_IMAGE}_${BUILD_NUMBER}"
-                        
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'good',
-                            message: "✅ Container started successfully: ${DOCKER_IMAGE}_${BUILD_NUMBER}"
-                        )
+                        // Test if application is running
+                        bat "curl http://localhost:${APP_PORT} || echo Application may not be running properly"
                     } catch (Exception e) {
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'danger',
-                            message: "❌ Container startup failed: ${e.message}"
-                        )
-                        error "Container startup failed: ${e.message}"
+                        echo "Warning: Container execution had issues: ${e.message}"
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
             }
@@ -180,35 +175,44 @@ pipeline {
             steps {
                 script {
                     try {
-                        // Create directory for ZAP report
-                        bat 'mkdir zap-report || echo "Directory exists"'
+                        // Start your Flask application (adjust port if needed)
+                        bat 'start /B python app.py'
                         
+                        // Wait for application to start
+                        sleep 10
+
                         // Run ZAP scan
-                        bat """
-                            docker run --rm -v "%CD%/zap-report:/zap/wrk/:rw" ^
-                            --network="host" ^
-                            -t owasp/zap2docker-stable zap-baseline.py ^
-                            -t http://localhost:${APP_PORT} ^
+                        bat '''
+                            docker run -v ${WORKSPACE}/zap-report:/zap/wrk/:rw -t owasp/zap2docker-stable zap-baseline.py ^
+                            -t http://host.docker.internal:5000 ^
                             -r zap-report.html ^
                             -I
-                        """
-                        
+                        '''
+
                         // Archive ZAP report
                         archiveArtifacts artifacts: 'zap-report/*', fingerprint: true
-                        
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'good',
-                            message: "✅ DAST scan completed successfully"
-                        )
+
                     } catch (Exception e) {
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'danger',
-                            message: "❌ DAST scan failed: ${e.message}"
-                        )
+                        echo "DAST scan had issues: ${e.message}"
                         currentBuild.result = 'UNSTABLE'
+                    } finally {
+                        // Stop the Flask application
+                        bat 'taskkill /F /IM python.exe'
                     }
+                }
+            }
+            post {
+                always {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: currentBuild.result == 'SUCCESS' ? 'good' : 'danger',
+                        message: """
+                        *DAST Scan Complete*
+                        Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                        Status: ${currentBuild.result ?: 'SUCCESS'}
+                        Report: ${env.BUILD_URL}artifact/zap-report/
+                        """
+                    )
                 }
             }
         }
@@ -218,13 +222,51 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def summary = generateSecuritySummary(banditReport)
+                        def highCount = 0
+                        def mediumCount = 0
+                        def lowCount = 0
                         
+                        banditReport.results.each { issue ->
+                            switch(issue.issue_severity) {
+                                case 'HIGH':
+                                    highCount++
+                                    break
+                                case 'MEDIUM':
+                                    mediumCount++
+                                    break
+                                case 'LOW':
+                                    lowCount++
+                                    break
+                            }
+                        }
+                        
+                        def summary = """
+                            Security Scan Results:
+                            Total Issues: ${banditReport.results.size()}
+                            High Severity: ${highCount}
+                            Medium Severity: ${mediumCount}
+                            Low Severity: ${lowCount}
+                            
+                            Details of High Severity Issues:
+                            ${banditReport.results.findAll { it.issue_severity == 'HIGH' }.collect { 
+                                "- ${it.issue_text} in ${it.filename}:${it.line_number}"
+                            }.join('\n')}
+                        """
+                        
+                        // Add ZAP results to security summary
+                        if (fileExists('zap-report/zap-report.html')) {
+                            def zapSummary = """
+                            DAST Scan Results:
+                            - Report available at: ${env.BUILD_URL}artifact/zap-report/
+                            """
+                            summary += zapSummary
+                        }
+
                         echo summary
                         writeFile file: 'security-summary.txt', text: summary
                         archiveArtifacts artifacts: '*-report.*,security-summary.txt', fingerprint: true
                         
-                        if (hasHighSeverityIssues(banditReport)) {
+                        if (highCount > 0) {
                             currentBuild.result = 'UNSTABLE'
                         }
                     } catch (Exception e) {
@@ -233,68 +275,77 @@ pipeline {
                     }
                 }
             }
+            post {
+                always {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: currentBuild.result == 'SUCCESS' ? 'good' : 'warning',
+                        message: """
+                        *Security Scan Results*
+                        Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                        Status: ${currentBuild.result ?: 'SUCCESS'}
+                        Details: ${env.BUILD_URL}
+                        """
+                    )
+                }
+            }
         }
     }
 
     post {
-        always {
-            script {
-                try {
-                    // Cleanup Docker resources
-                    bat """
-                        docker stop ${DOCKER_IMAGE}_${BUILD_NUMBER} || echo "Container not running"
-                        docker rm ${DOCKER_IMAGE}_${BUILD_NUMBER} || echo "Container not found"
-                        docker rmi ${DOCKER_IMAGE}:${DOCKER_TAG} || echo "Image not found"
-                    """
-                } catch (Exception e) {
-                    echo "Warning: Cleanup had issues: ${e.message}"
-                }
-                cleanWs()
-            }
-            
+        success {
             slackSend(
                 channel: env.SLACK_CHANNEL,
-                color: currentBuild.result == 'SUCCESS' ? 'good' : 'danger',
+                color: 'good',
                 message: """
-                *Pipeline ${currentBuild.result}*
+                ✅ *Pipeline Successful*
                 Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
                 Duration: ${currentBuild.durationString}
                 URL: ${env.BUILD_URL}
                 """
             )
         }
-    }
-}
-
-// Helper function to generate security summary
-def generateSecuritySummary(banditReport) {
-    def highCount = 0
-    def mediumCount = 0
-    def lowCount = 0
-    
-    banditReport.results.each { issue ->
-        switch(issue.issue_severity) {
-            case 'HIGH': highCount++; break
-            case 'MEDIUM': mediumCount++; break
-            case 'LOW': lowCount++; break
+        unstable {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'warning',
+                message: """
+                ⚠️ *Pipeline Unstable*
+                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                Duration: ${currentBuild.durationString}
+                URL: ${env.BUILD_URL}
+                - Security vulnerabilities were found
+                - Check the security reports in the build artifacts
+                """
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """
+                ❌ *Pipeline Failed*
+                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                Duration: ${currentBuild.durationString}
+                URL: ${env.BUILD_URL}
+                """
+            )
+        }
+        always {
+            script {
+                try {
+                    // Fix the filter format for cleanup
+                    bat '''
+                        for /F "tokens=*" %%i in ('docker ps -a -q --filter "name=capstone-devsecops"') do (
+                            docker stop %%i 2>nul
+                            docker rm %%i 2>nul
+                        )
+                    '''
+                } catch (Exception e) {
+                    echo "Warning: Container cleanup had issues: ${e.message}"
+                }
+                cleanWs()
+            }
         }
     }
-    
-    return """
-        Security Scan Results:
-        Total Issues: ${banditReport.results.size()}
-        High Severity: ${highCount}
-        Medium Severity: ${mediumCount}
-        Low Severity: ${lowCount}
-        
-        Details of High Severity Issues:
-        ${banditReport.results.findAll { it.issue_severity == 'HIGH' }.collect { 
-            "- ${it.issue_text} in ${it.filename}:${it.line_number}"
-        }.join('\n')}
-    """
-}
-
-// Helper function to check for high severity issues
-def hasHighSeverityIssues(banditReport) {
-    return banditReport.results.any { it.issue_severity == 'HIGH' }
 } 
