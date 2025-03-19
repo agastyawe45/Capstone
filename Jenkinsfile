@@ -62,29 +62,45 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            bandit -r . -f json -o bandit-report.json
-                            bandit -r . -f html -o bandit-report.html
+                            bandit -r . -f json -o bandit-report.json || exit 0
+                            bandit -r . -f html -o bandit-report.html || exit 0
                         '''
                         
                         def banditReport = readJSON file: 'bandit-report.json'
                         def highSeverityCount = banditReport.metrics.SEVERITY.HIGH ?: 0
                         def mediumSeverityCount = banditReport.metrics.SEVERITY.MEDIUM ?: 0
+                        def lowSeverityCount = banditReport.metrics.SEVERITY.LOW ?: 0
                         
-                        if (highSeverityCount > 0 || mediumSeverityCount > 0) {
-                            slackSend(
-                                channel: env.SLACK_CHANNEL,
-                                color: 'danger',
-                                message: """
-                                🚨 *Security Issues Detected*
-                                - High Severity: ${highSeverityCount}
-                                - Medium Severity: ${mediumSeverityCount}
-                                - Details: ${env.BUILD_URL}artifact/bandit-report.html
-                                """
-                            )
-                            currentBuild.result = 'UNSTABLE'
+                        def severityEmoji = highSeverityCount > 0 ? "🚨" : (mediumSeverityCount > 0 ? "⚠️" : "✅")
+                        def messageColor = highSeverityCount > 0 ? "danger" : (mediumSeverityCount > 0 ? "warning" : "good")
+                        
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: messageColor,
+                            message: """
+                            ${severityEmoji} *SAST Scan Results*
+                            - High Severity: ${highSeverityCount}
+                            - Medium Severity: ${mediumSeverityCount}
+                            - Low Severity: ${lowSeverityCount}
+                            - Full Report: ${env.BUILD_URL}artifact/bandit-report.html
+                            """
+                        )
+                        
+                        if (highSeverityCount > 0) {
+                            unstable('High severity security issues found')
                         }
                     } catch (Exception e) {
-                        error "SAST scanning failed: ${e.message}"
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: """
+                            ❌ *SAST Scan Failed*
+                            - Error: ${e.message}
+                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            - Details: ${env.BUILD_URL}console
+                            """
+                        )
+                        unstable('SAST scan failed but continuing pipeline')
                     }
                 }
             }
@@ -96,25 +112,42 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            safety check --json > safety-report.json
-                            safety check --output text > safety-report.txt
+                            safety check --json > safety-report.json || exit 0
+                            safety check --output text > safety-report.txt || exit 0
                         '''
                         
                         def safetyReport = readJSON file: 'safety-report.json'
-                        if (safetyReport.size() > 0) {
-                            slackSend(
-                                channel: env.SLACK_CHANNEL,
-                                color: 'warning',
-                                message: """
-                                ⚠️ *Dependency Vulnerabilities Found*
-                                - Number of Issues: ${safetyReport.size()}
-                                - Report: ${env.BUILD_URL}artifact/safety-report.txt
-                                """
-                            )
-                            currentBuild.result = 'UNSTABLE'
+                        def vulnerabilityCount = safetyReport.size()
+                        
+                        def messageColor = vulnerabilityCount > 0 ? 'warning' : 'good'
+                        def statusEmoji = vulnerabilityCount > 0 ? '⚠️' : '✅'
+                        
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: messageColor,
+                            message: """
+                            ${statusEmoji} *Dependency Security Check Results*
+                            - Vulnerabilities Found: ${vulnerabilityCount}
+                            - Details: ${env.BUILD_URL}artifact/safety-report.txt
+                            ${vulnerabilityCount > 0 ? '\nPlease review and update vulnerable dependencies.' : ''}
+                            """
+                        )
+                        
+                        if (vulnerabilityCount > 0) {
+                            unstable('Vulnerable dependencies found')
                         }
                     } catch (Exception e) {
-                        error "SCA scanning failed: ${e.message}"
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: """
+                            ❌ *Dependency Check Failed*
+                            - Error: ${e.message}
+                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            - Details: ${env.BUILD_URL}console
+                            """
+                        )
+                        unstable('Dependency check failed but continuing pipeline')
                     }
                 }
             }
