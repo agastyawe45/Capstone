@@ -158,13 +158,16 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
+                        def metrics = banditReport.metrics ?: [:]
+                        def severity = metrics.SEVERITY ?: [:]
+                        
                         def summary = """
                             🔒 *Security Scan Summary*
                             
                             SAST Results (Bandit):
-                            - High Severity: ${banditReport.metrics.SEVERITY.HIGH ?: 0}
-                            - Medium Severity: ${banditReport.metrics.SEVERITY.MEDIUM ?: 0}
-                            - Low Severity: ${banditReport.metrics.SEVERITY.LOW ?: 0}
+                            - High Severity: ${severity.HIGH ?: 0}
+                            - Medium Severity: ${severity.MEDIUM ?: 0}
+                            - Low Severity: ${severity.LOW ?: 0}
                             
                             Detailed findings available in build artifacts:
                             - Bandit Report: ${env.BUILD_URL}artifact/bandit-report.html
@@ -181,7 +184,17 @@ pipeline {
                         
                         echo summary
                     } catch (Exception e) {
-                        error "Report analysis failed: ${e.message}"
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: """
+                            ❌ *Security Report Analysis Failed*
+                            - Error: ${e.message}
+                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            - Details: ${env.BUILD_URL}console
+                            """
+                        )
+                        unstable('Report analysis failed but continuing pipeline')
                     }
                 }
             }
