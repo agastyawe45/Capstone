@@ -41,30 +41,48 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            bandit -r . -f json -o bandit-report.json || exit 0
-                            bandit -r . -f html -o bandit-report.html || exit 0
+                            bandit -r . -f json -o bandit-report.json -ll || exit 0
+                            bandit -r . -f html -o bandit-report.html -ll || exit 0
                         '''
                         
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def metrics = banditReport.metrics ?: [:]
-                        def severity = metrics.SEVERITY ?: [:]
+                        def metrics = banditReport.metrics
                         
-                        def highSeverityCount = severity.HIGH ?: 0
-                        def mediumSeverityCount = severity.MEDIUM ?: 0
+                        // Count high severity issues across all files
+                        def highSeverityCount = 0
+                        def mediumSeverityCount = 0
+                        metrics.each { file, fileMetrics ->
+                            if (fileMetrics['SEVERITY.HIGH']) {
+                                highSeverityCount += fileMetrics['SEVERITY.HIGH']
+                            }
+                            if (fileMetrics['SEVERITY.MEDIUM']) {
+                                mediumSeverityCount += fileMetrics['SEVERITY.MEDIUM']
+                            }
+                        }
+                        
+                        // Create detailed report
+                        def reportSummary = "Security Issues Found:\\n"
+                        metrics.each { file, fileMetrics ->
+                            if (fileMetrics['SEVERITY.HIGH'] > 0 || fileMetrics['SEVERITY.MEDIUM'] > 0) {
+                                reportSummary += "- ${file}:\\n"
+                                reportSummary += "  High: ${fileMetrics['SEVERITY.HIGH'] ?: 0}, Medium: ${fileMetrics['SEVERITY.MEDIUM'] ?: 0}\\n"
+                            }
+                        }
                         
                         slackSend(
                             channel: env.SLACK_CHANNEL,
-                            color: highSeverityCount > 0 ? 'danger' : 'good',
+                            color: highSeverityCount > 0 ? 'danger' : (mediumSeverityCount > 0 ? 'warning' : 'good'),
                             message: """
-                            ${highSeverityCount > 0 ? '🚨' : '✅'} *SAST Scan Results*
+                            ${highSeverityCount > 0 ? '🚨' : mediumSeverityCount > 0 ? '⚠️' : '✅'} *SAST Scan Results*
                             - High Severity Issues: ${highSeverityCount}
                             - Medium Severity Issues: ${mediumSeverityCount}
-                            - Report: ${env.BUILD_URL}artifact/bandit-report.html
+                            ${reportSummary}
+                            - Full Report: ${env.BUILD_URL}artifact/bandit-report.html
                             """
                         )
                         
                         if (highSeverityCount > 0) {
-                            unstable('High severity security issues found')
+                            error('High severity security issues found')
                         }
                     } catch (Exception e) {
                         slackSend(
@@ -72,7 +90,7 @@ pipeline {
                             color: 'danger',
                             message: "❌ *SAST Scan Failed*\nError: ${e.getMessage()}"
                         )
-                        unstable("SAST scan failed: ${e.getMessage()}")
+                        error("SAST scan failed: ${e.getMessage()}")
                     }
                 }
             }
@@ -82,35 +100,27 @@ pipeline {
             steps {
                 script {
                     try {
-                        // Run Pyraider and save output to a file
                         bat '''
                             call venv\\Scripts\\activate.bat
                             pyraider check -f requirements.txt > pyraider-report.txt
                         '''
                         
-                        // Read the report content
                         def reportContent = readFile('pyraider-report.txt')
-                        
-                        // Check for critical/high severity findings
                         def hasCritical = reportContent.toLowerCase().contains('critical')
                         def hasHigh = reportContent.toLowerCase().contains('high')
                         
-                        // Determine notification color and status
-                        def color = (hasCritical || hasHigh) ? 'danger' : 'warning'
-                        def emoji = (hasCritical || hasHigh) ? '🚨' : '⚠️'
-                        
                         slackSend(
                             channel: env.SLACK_CHANNEL,
-                            color: color,
+                            color: (hasCritical || hasHigh) ? 'danger' : 'warning',
                             message: """
-                            ${emoji} *SCA Scan Results*
+                            ${(hasCritical || hasHigh) ? '🚨' : '⚠️'} *SCA Scan Results*
                             - Found ${hasCritical ? 'CRITICAL' : hasHigh ? 'HIGH' : 'MEDIUM/LOW'} severity vulnerabilities
                             - Report: ${env.BUILD_URL}artifact/pyraider-report.txt
                             """
                         )
                         
                         if (hasCritical || hasHigh) {
-                            unstable('Critical/High severity vulnerabilities found')
+                            error('Critical/High severity vulnerabilities found in dependencies')
                         }
                     } catch (Exception e) {
                         slackSend(
@@ -118,7 +128,7 @@ pipeline {
                             color: 'danger',
                             message: "❌ *SCA Check Failed*\nError: ${e.getMessage()}"
                         )
-                        unstable("SCA check failed: ${e.getMessage()}")
+                        error("SCA check failed: ${e.getMessage()}")
                     }
                 }
             }
@@ -133,7 +143,6 @@ pipeline {
                             pdoc3 --html --output-dir docs app/
                         '''
                         
-                        // Generate security report and remediation guide
                         writeFile file: 'security-report.md', text: """
                         # Security Analysis Report
                         
@@ -147,11 +156,11 @@ pipeline {
                         - SCA Report: ${env.BUILD_URL}artifact/pyraider-report.txt
                         
                         ## Remediation Guidelines
-                        1. Address all high severity issues immediately
-                        2. Update vulnerable dependencies
-                        3. Follow secure coding practices
-                        4. Implement input validation
-                        5. Use parameterized queries
+                        1. Review and fix all high severity issues immediately
+                        2. Update dependencies with known vulnerabilities
+                        3. Implement input validation for all user inputs
+                        4. Use parameterized queries for database operations
+                        5. Follow secure coding practices
                         
                         ## Documentation
                         - API Documentation: ${env.BUILD_URL}artifact/docs/index.html
