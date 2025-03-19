@@ -4,11 +4,14 @@ pipeline {
     environment {
         SLACK_CHANNEL = '#jenkins-notifications'
         SLACK_TOKEN = credentials('slack-token')
+        PYTHON_PATH = 'C:\\Python312\\python.exe'  // Adjust this path to your Python installation
     }
 
     stages {
         stage('Checkout') {
             steps {
+                // Clean workspace before checkout
+                cleanWs()
                 checkout scm
             }
             post {
@@ -16,22 +19,22 @@ pipeline {
                     slackSend(
                         channel: env.SLACK_CHANNEL,
                         color: 'good',
-                        message: "✅ Code checkout successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
-                    )
-                }
-                failure {
-                    slackSend(
-                        channel: env.SLACK_CHANNEL,
-                        color: 'danger',
-                        message: "❌ Code checkout failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                        message: """
+                        ✅ *Source Code Checkout Complete*
+                        - Repository: ${env.GIT_URL ?: 'N/A'}
+                        - Branch: ${env.GIT_BRANCH ?: 'N/A'}
+                        - Commit: ${env.GIT_COMMIT ?: 'N/A'}
+                        """
                     )
                 }
             }
         }
 
-        stage('Install Dependencies') {
+        stage('Setup Python Environment') {
             steps {
                 bat '''
+                    python -m venv venv
+                    call venv\\Scripts\\activate.bat
                     python -m pip install --upgrade pip
                     pip install -r requirements.txt
                     pip install bandit safety pytest
@@ -39,57 +42,79 @@ pipeline {
             }
         }
 
-        stage('Run Tests') {
+        stage('Run Unit Tests') {
             steps {
-                bat 'python -m pytest tests/'
+                bat '''
+                    call venv\\Scripts\\activate.bat
+                    python -m pytest tests/ --junitxml=test-results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                }
             }
         }
 
-        stage('SAST - Bandit Scan') {
+        stage('SAST - Bandit Security Scan') {
             steps {
                 script {
                     try {
-                        bat 'bandit -r . -f json -o bandit-report.json'
-                        def banditReport = readJSON file: 'bandit-report.json'
+                        bat '''
+                            call venv\\Scripts\\activate.bat
+                            bandit -r . -f json -o bandit-report.json
+                            bandit -r . -f html -o bandit-report.html
+                        '''
                         
-                        if (banditReport.results.size() > 0) {
+                        def banditReport = readJSON file: 'bandit-report.json'
+                        def highSeverityCount = banditReport.metrics.SEVERITY.HIGH ?: 0
+                        def mediumSeverityCount = banditReport.metrics.SEVERITY.MEDIUM ?: 0
+                        
+                        if (highSeverityCount > 0 || mediumSeverityCount > 0) {
                             slackSend(
                                 channel: env.SLACK_CHANNEL,
-                                color: 'warning',
+                                color: 'danger',
                                 message: """
-                                ⚠️ *Security Issues Found*
-                                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                                - Issues: ${banditReport.results.size()}
-                                - Details: ${env.BUILD_URL}artifact/bandit-report.json
+                                🚨 *Security Issues Detected*
+                                - High Severity: ${highSeverityCount}
+                                - Medium Severity: ${mediumSeverityCount}
+                                - Details: ${env.BUILD_URL}artifact/bandit-report.html
                                 """
                             )
+                            currentBuild.result = 'UNSTABLE'
                         }
                     } catch (Exception e) {
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'danger',
-                            message: "❌ SAST scan failed: ${e.message}"
-                        )
-                        currentBuild.result = 'UNSTABLE'
+                        error "SAST scanning failed: ${e.message}"
                     }
                 }
             }
         }
 
-        stage('SCA - Safety Check') {
+        stage('SCA - Dependencies Security Check') {
             steps {
                 script {
                     try {
-                        bat 'safety check --json > safety-report.json || exit 0'
-                        def safetyReport = readJSON file: 'safety-report.json'
+                        bat '''
+                            call venv\\Scripts\\activate.bat
+                            safety check --json > safety-report.json
+                            safety check --output text > safety-report.txt
+                        '''
                         
+                        def safetyReport = readJSON file: 'safety-report.json'
                         if (safetyReport.size() > 0) {
-                            echo "Safety found dependency issues"
+                            slackSend(
+                                channel: env.SLACK_CHANNEL,
+                                color: 'warning',
+                                message: """
+                                ⚠️ *Dependency Vulnerabilities Found*
+                                - Number of Issues: ${safetyReport.size()}
+                                - Report: ${env.BUILD_URL}artifact/safety-report.txt
+                                """
+                            )
                             currentBuild.result = 'UNSTABLE'
                         }
                     } catch (Exception e) {
-                        echo "Error in Safety check: ${e.message}"
-                        currentBuild.result = 'UNSTABLE'
+                        error "SCA scanning failed: ${e.message}"
                     }
                 }
             }
@@ -100,56 +125,31 @@ pipeline {
                 script {
                     try {
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def highCount = 0
-                        def mediumCount = 0
-                        def lowCount = 0
-                        
-                        banditReport.results.each { issue ->
-                            switch(issue.issue_severity) {
-                                case 'HIGH': highCount++; break
-                                case 'MEDIUM': mediumCount++; break
-                                case 'LOW': lowCount++; break
-                            }
-                        }
-                        
                         def summary = """
-                            Security Scan Results:
-                            Total Issues: ${banditReport.results.size()}
-                            High Severity: ${highCount}
-                            Medium Severity: ${mediumCount}
-                            Low Severity: ${lowCount}
+                            🔒 *Security Scan Summary*
                             
-                            Details of High Severity Issues:
-                            ${banditReport.results.findAll { it.issue_severity == 'HIGH' }.collect { 
-                                "- ${it.issue_text} in ${it.filename}:${it.line_number}"
-                            }.join('\n')}
+                            SAST Results (Bandit):
+                            - High Severity: ${banditReport.metrics.SEVERITY.HIGH ?: 0}
+                            - Medium Severity: ${banditReport.metrics.SEVERITY.MEDIUM ?: 0}
+                            - Low Severity: ${banditReport.metrics.SEVERITY.LOW ?: 0}
+                            
+                            Detailed findings available in build artifacts:
+                            - Bandit Report: ${env.BUILD_URL}artifact/bandit-report.html
+                            - Safety Report: ${env.BUILD_URL}artifact/safety-report.txt
                         """
+                        
+                        writeFile file: 'security-summary.txt', text: summary
+                        archiveArtifacts artifacts: '''
+                            *-report.json,
+                            *-report.html,
+                            *-report.txt,
+                            security-summary.txt
+                        ''', fingerprint: true
                         
                         echo summary
-                        writeFile file: 'security-summary.txt', text: summary
-                        archiveArtifacts artifacts: '*-report.*,security-summary.txt', fingerprint: true
-                        
-                        if (highCount > 0) {
-                            currentBuild.result = 'UNSTABLE'
-                        }
                     } catch (Exception e) {
-                        echo "Error analyzing security reports: ${e.message}"
-                        currentBuild.result = 'UNSTABLE'
+                        error "Report analysis failed: ${e.message}"
                     }
-                }
-            }
-            post {
-                always {
-                    slackSend(
-                        channel: env.SLACK_CHANNEL,
-                        color: currentBuild.result == 'SUCCESS' ? 'good' : 'warning',
-                        message: """
-                        *Security Scan Results*
-                        Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                        Status: ${currentBuild.result ?: 'SUCCESS'}
-                        Details: ${env.BUILD_URL}
-                        """
-                    )
                 }
             }
         }
@@ -161,10 +161,10 @@ pipeline {
                 channel: env.SLACK_CHANNEL,
                 color: 'good',
                 message: """
-                ✅ *Pipeline Successful*
-                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                Duration: ${currentBuild.durationString}
-                URL: ${env.BUILD_URL}
+                ✅ *Pipeline Completed Successfully*
+                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                - Duration: ${currentBuild.durationString}
+                - Results: ${env.BUILD_URL}
                 """
             )
         }
@@ -173,12 +173,11 @@ pipeline {
                 channel: env.SLACK_CHANNEL,
                 color: 'warning',
                 message: """
-                ⚠️ *Pipeline Unstable*
-                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                Duration: ${currentBuild.durationString}
-                URL: ${env.BUILD_URL}
-                - Security vulnerabilities were found
-                - Check the security reports in the build artifacts
+                ⚠️ *Pipeline Unstable - Security Issues Found*
+                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                - Duration: ${currentBuild.durationString}
+                - Security Reports: ${env.BUILD_URL}artifact/
+                Please review the security findings and take necessary actions.
                 """
             )
         }
@@ -188,9 +187,9 @@ pipeline {
                 color: 'danger',
                 message: """
                 ❌ *Pipeline Failed*
-                Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                Duration: ${currentBuild.durationString}
-                URL: ${env.BUILD_URL}
+                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                - Duration: ${currentBuild.durationString}
+                - Error Details: ${env.BUILD_URL}console
                 """
             )
         }
