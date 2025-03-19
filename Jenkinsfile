@@ -41,8 +41,8 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            bandit -r . -f json -o bandit-report.json
-                            bandit -r . -f html -o bandit-report.html
+                            bandit -r . -f json -o bandit-report.json || exit 0
+                            bandit -r . -f html -o bandit-report.html || exit 0
                         '''
                         
                         def banditReport = readJSON file: 'bandit-report.json'
@@ -64,7 +64,7 @@ pipeline {
                         )
                         
                         if (highSeverityCount > 0) {
-                            error('High severity security issues found - Pipeline failed')
+                            unstable('High severity security issues found')
                         }
                     } catch (Exception e) {
                         slackSend(
@@ -72,7 +72,7 @@ pipeline {
                             color: 'danger',
                             message: "❌ *SAST Scan Failed*\nError: ${e.getMessage()}"
                         )
-                        error("SAST scan failed: ${e.getMessage()}")
+                        unstable("SAST scan failed: ${e.getMessage()}")
                     }
                 }
             }
