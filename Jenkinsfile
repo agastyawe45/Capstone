@@ -24,14 +24,12 @@ pipeline {
 
         stage('Setup Python Environment') {
             steps {
-                script {
-                    bat '''
-                        python -m venv venv
-                        call venv\\Scripts\\activate.bat
-                        python -m pip install --upgrade pip
-                        pip install -r requirements.txt
-                    '''
-                }
+                bat '''
+                    python -m venv venv
+                    call venv\\Scripts\\activate.bat
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                '''
             }
         }
 
@@ -53,24 +51,15 @@ pipeline {
                         def mediumSeverityCount = severity.MEDIUM ?: 0
                         def lowSeverityCount = severity.LOW ?: 0
                         
-                        def severityEmoji = highSeverityCount > 0 ? "🚨" : (mediumSeverityCount > 0 ? "⚠️" : "✅")
-                        def messageColor = highSeverityCount > 0 ? "danger" : (mediumSeverityCount > 0 ? "warning" : "good")
-                        
-                        // Enhanced SAST reporting with remediation guidance
                         slackSend(
                             channel: env.SLACK_CHANNEL,
-                            color: messageColor,
+                            color: highSeverityCount > 0 ? 'danger' : (mediumSeverityCount > 0 ? 'warning' : 'good'),
                             message: """
-                            ${severityEmoji} *SAST Scan Results*
+                            ${highSeverityCount > 0 ? '🚨' : (mediumSeverityCount > 0 ? '⚠️' : '✅')} *SAST Scan Results*
                             - High Severity: ${highSeverityCount}
                             - Medium Severity: ${mediumSeverityCount}
                             - Low Severity: ${lowSeverityCount}
                             - Full Report: ${env.BUILD_URL}artifact/bandit-report.html
-                            
-                            ${highSeverityCount > 0 ? '''🚨 *Critical Security Issues Found:*
-                            - Review high-severity findings immediately
-                            - Follow secure coding guidelines
-                            - Update vulnerable code patterns''' : ''}
                             """
                         )
                         
@@ -78,7 +67,17 @@ pipeline {
                             unstable('High severity security issues found')
                         }
                     } catch (Exception e) {
-                        handleScanError('SAST', e)
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: """
+                            ❌ *SAST Scan Failed*
+                            - Error: ${e.getMessage()}
+                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            - Console: ${env.BUILD_URL}console
+                            """
+                        )
+                        unstable('SAST scan failed but continuing pipeline')
                     }
                 }
             }
@@ -90,28 +89,19 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            pip install pyraider
                             pyraider scan > pyraider-report.json
                         '''
                         
                         def pyraiderReport = readJSON file: 'pyraider-report.json'
                         def vulnerabilityCount = pyraiderReport.size() ?: 0
                         
-                        def messageColor = vulnerabilityCount > 0 ? 'warning' : 'good'
-                        def statusEmoji = vulnerabilityCount > 0 ? '⚠️' : '✅'
-                        
                         slackSend(
                             channel: env.SLACK_CHANNEL,
-                            color: messageColor,
+                            color: vulnerabilityCount > 0 ? 'warning' : 'good',
                             message: """
-                            ${statusEmoji} *SCA (Pyraider) Results*
+                            ${vulnerabilityCount > 0 ? '⚠️' : '✅'} *SCA Results*
                             - Vulnerabilities Found: ${vulnerabilityCount}
                             - Details: ${env.BUILD_URL}artifact/pyraider-report.json
-                            
-                            ${vulnerabilityCount > 0 ? '''⚠️ *Remediation Steps:*
-                            1. Update vulnerable dependencies
-                            2. Review dependency changelog
-                            3. Test application after updates''' : ''}
                             """
                         )
                         
@@ -119,7 +109,17 @@ pipeline {
                             unstable('Vulnerable dependencies found')
                         }
                     } catch (Exception e) {
-                        handleScanError('SCA', e)
+                        slackSend(
+                            channel: env.SLACK_CHANNEL,
+                            color: 'danger',
+                            message: """
+                            ❌ *SCA Check Failed*
+                            - Error: ${e.getMessage()}
+                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            - Console: ${env.BUILD_URL}console
+                            """
+                        )
+                        unstable('SCA check failed but continuing pipeline')
                     }
                 }
             }
@@ -175,6 +175,13 @@ pipeline {
     }
 
     post {
+        always {
+            archiveArtifacts artifacts: '''
+                *-report.json,
+                *-report.html
+            ''', allowEmptyArchive: true
+            cleanWs()
+        }
         success {
             slackSend(
                 channel: env.SLACK_CHANNEL,
@@ -183,8 +190,6 @@ pipeline {
                 ✅ *Pipeline Completed Successfully*
                 - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
                 - Duration: ${currentBuild.durationString}
-                - Documentation: ${env.BUILD_URL}artifact/docs/
-                - Security Report: ${env.BUILD_URL}artifact/security-report.md
                 """
             )
         }
@@ -196,13 +201,7 @@ pipeline {
                 ⚠️ *Pipeline Unstable - Security Issues Found*
                 - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
                 - Duration: ${currentBuild.durationString}
-                - Security Reports: ${env.BUILD_URL}artifact/
-                
-                *Required Actions:*
-                1. Review security findings
-                2. Update vulnerable dependencies
-                3. Fix identified code issues
-                4. Re-run pipeline after fixes
+                - Reports: ${env.BUILD_URL}artifact/
                 """
             )
         }
@@ -214,12 +213,9 @@ pipeline {
                 ❌ *Pipeline Failed*
                 - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
                 - Duration: ${currentBuild.durationString}
-                - Error Details: ${env.BUILD_URL}console
+                - Console: ${env.BUILD_URL}console
                 """
             )
-        }
-        always {
-            cleanWs()
         }
     }
 }
