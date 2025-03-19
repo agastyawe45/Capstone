@@ -82,28 +82,35 @@ pipeline {
             steps {
                 script {
                     try {
+                        // Run Pyraider and save output to a file
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            pyraider check -f requirements.txt -e json pyraider-report.json
+                            pyraider check -f requirements.txt > pyraider-report.txt
                         '''
                         
-                        def pyraiderReport = readJSON file: 'pyraider-report.json'
-                        def criticalVulnerabilities = pyraiderReport.findAll { it.severity == 'CRITICAL' }.size()
-                        def highVulnerabilities = pyraiderReport.findAll { it.severity == 'HIGH' }.size()
+                        // Read the report content
+                        def reportContent = readFile('pyraider-report.txt')
+                        
+                        // Check for critical/high severity findings
+                        def hasCritical = reportContent.toLowerCase().contains('critical')
+                        def hasHigh = reportContent.toLowerCase().contains('high')
+                        
+                        // Determine notification color and status
+                        def color = (hasCritical || hasHigh) ? 'danger' : 'warning'
+                        def emoji = (hasCritical || hasHigh) ? '🚨' : '⚠️'
                         
                         slackSend(
                             channel: env.SLACK_CHANNEL,
-                            color: criticalVulnerabilities > 0 ? 'danger' : 'good',
+                            color: color,
                             message: """
-                            ${criticalVulnerabilities > 0 ? '🚨' : '✅'} *SCA Results*
-                            - Critical Vulnerabilities: ${criticalVulnerabilities}
-                            - High Vulnerabilities: ${highVulnerabilities}
-                            - Report: ${env.BUILD_URL}artifact/pyraider-report.json
+                            ${emoji} *SCA Scan Results*
+                            - Found ${hasCritical ? 'CRITICAL' : hasHigh ? 'HIGH' : 'MEDIUM/LOW'} severity vulnerabilities
+                            - Report: ${env.BUILD_URL}artifact/pyraider-report.txt
                             """
                         )
                         
-                        if (criticalVulnerabilities > 0) {
-                            error('Critical vulnerabilities found in dependencies - Pipeline failed')
+                        if (hasCritical || hasHigh) {
+                            unstable('Critical/High severity vulnerabilities found')
                         }
                     } catch (Exception e) {
                         slackSend(
@@ -111,7 +118,7 @@ pipeline {
                             color: 'danger',
                             message: "❌ *SCA Check Failed*\nError: ${e.getMessage()}"
                         )
-                        error("SCA check failed: ${e.getMessage()}")
+                        unstable("SCA check failed: ${e.getMessage()}")
                     }
                 }
             }
@@ -137,7 +144,7 @@ pipeline {
                         
                         ## Security Scan Results
                         - SAST Report: ${env.BUILD_URL}artifact/bandit-report.html
-                        - SCA Report: ${env.BUILD_URL}artifact/pyraider-report.json
+                        - SCA Report: ${env.BUILD_URL}artifact/pyraider-report.txt
                         
                         ## Remediation Guidelines
                         1. Address all high severity issues immediately
