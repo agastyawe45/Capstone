@@ -1,10 +1,43 @@
-options {
-    timestamps()  // Add timestamps to console output
-    timeout(time: 30, unit: 'MINUTES')  // Global timeout
-    buildDiscarder(logRotator(numToKeepStr: '10'))  // Keep only last 10 builds
-    disableConcurrentBuilds()  // Prevent concurrent executions
-}
+pipeline {
+    agent any
 
+    environment {
+        SLACK_CHANNEL = '#jenkins-notifications'
+        SLACK_TOKEN = credentials('slack-token')
+        PYTHON_PATH = 'C:\\Python312\\python.exe'
+    }
+
+    options {
+        timestamps()  // Add timestamps to console output
+        timeout(time: 30, unit: 'MINUTES')  // Global timeout
+        buildDiscarder(logRotator(numToKeepStr: '10'))  // Keep only last 10 builds
+        disableConcurrentBuilds()  // Prevent concurrent executions
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        stage('Setup Python Environment') {
+            steps {
+                script {
+                    bat '''
+                        python -m venv venv
+                        call venv\\Scripts\\activate.bat
+                        python -m pip install --upgrade pip
+                        pip install -r requirements.txt
+                    '''
+                }
+            }
+        }
+
+        stage('SAST - Bandit Security Scan') {
+            steps {
+                script {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
@@ -51,7 +84,6 @@ options {
             }
         }
 
-        // Stage 5: SCA with Pyraider
         stage('SCA - Pyraider Security Check') {
             steps {
                 script {
@@ -93,7 +125,6 @@ options {
             }
         }
 
-        // Stage 6: Documentation and Report Generation
         stage('Documentation and Reports') {
             steps {
                 script {
