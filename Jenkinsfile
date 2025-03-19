@@ -74,7 +74,6 @@ pipeline {
                             ❌ *SAST Scan Failed*
                             - Error: ${e.getMessage()}
                             - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                            - Console: ${env.BUILD_URL}console
                             """
                         )
                         unstable('SAST scan failed but continuing pipeline')
@@ -89,7 +88,7 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            pyraider scan > pyraider-report.json
+                            pyraider check -f requirements.txt > pyraider-report.json
                         '''
                         
                         def pyraiderReport = readJSON file: 'pyraider-report.json'
@@ -116,7 +115,6 @@ pipeline {
                             ❌ *SCA Check Failed*
                             - Error: ${e.getMessage()}
                             - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                            - Console: ${env.BUILD_URL}console
                             """
                         )
                         unstable('SCA check failed but continuing pipeline')
@@ -213,7 +211,6 @@ pipeline {
                 ❌ *Pipeline Failed*
                 - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
                 - Duration: ${currentBuild.durationString}
-                - Console: ${env.BUILD_URL}console
                 """
             )
         }
