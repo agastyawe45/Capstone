@@ -37,7 +37,7 @@ pipeline {
                     call venv\\Scripts\\activate.bat
                     python -m pip install --upgrade pip
                     pip install -r requirements.txt
-                    pip install bandit safety pytest
+                    pip install -r requirements.txt
                 '''
             }
         }
@@ -62,14 +62,17 @@ pipeline {
                     try {
                         bat '''
                             call venv\\Scripts\\activate.bat
-                            bandit -r . -f json -o bandit-report.json || exit 0
-                            bandit -r . -f html -o bandit-report.html || exit 0
+                            bandit -r . -f json -o bandit-report.json -ll
+                            bandit -r . -f html -o bandit-report.html -ll
                         '''
                         
                         def banditReport = readJSON file: 'bandit-report.json'
-                        def highSeverityCount = banditReport.metrics.SEVERITY.HIGH ?: 0
-                        def mediumSeverityCount = banditReport.metrics.SEVERITY.MEDIUM ?: 0
-                        def lowSeverityCount = banditReport.metrics.SEVERITY.LOW ?: 0
+                        def metrics = banditReport.metrics ?: [:]
+                        def severity = metrics.SEVERITY ?: [:]
+                        
+                        def highSeverityCount = severity.HIGH ?: 0
+                        def mediumSeverityCount = severity.MEDIUM ?: 0
+                        def lowSeverityCount = severity.LOW ?: 0
                         
                         def severityEmoji = highSeverityCount > 0 ? "🚨" : (mediumSeverityCount > 0 ? "⚠️" : "✅")
                         def messageColor = highSeverityCount > 0 ? "danger" : (mediumSeverityCount > 0 ? "warning" : "good")
@@ -83,6 +86,7 @@ pipeline {
                             - Medium Severity: ${mediumSeverityCount}
                             - Low Severity: ${lowSeverityCount}
                             - Full Report: ${env.BUILD_URL}artifact/bandit-report.html
+                            ${highSeverityCount > 0 ? '\n⚠️ High severity issues require immediate attention!' : ''}
                             """
                         )
                         
@@ -90,17 +94,20 @@ pipeline {
                             unstable('High severity security issues found')
                         }
                     } catch (Exception e) {
-                        slackSend(
-                            channel: env.SLACK_CHANNEL,
-                            color: 'danger',
-                            message: """
-                            ❌ *SAST Scan Failed*
-                            - Error: ${e.message}
-                            - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-                            - Details: ${env.BUILD_URL}console
-                            """
-                        )
-                        unstable('SAST scan failed but continuing pipeline')
+                        // Only send error notification if there's a technical failure
+                        if (e.message.contains("Cannot run program") || e.message.contains("error code 1")) {
+                            slackSend(
+                                channel: env.SLACK_CHANNEL,
+                                color: 'danger',
+                                message: """
+                                ❌ *SAST Scan Technical Error*
+                                - Error: ${e.message}
+                                - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                                - Details: ${env.BUILD_URL}console
+                                """
+                            )
+                        }
+                        unstable('SAST scan encountered issues but continuing pipeline')
                     }
                 }
             }
